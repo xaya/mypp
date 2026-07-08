@@ -1,4 +1,4 @@
-// Copyright (C) 2024 The Xaya developers
+// Copyright (C) 2024-2026 The Xaya developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -288,6 +288,49 @@ TEST_F (StatementTests, Unicode)
   stmt.Query ();
   ASSERT_TRUE (stmt.Fetch ());
   EXPECT_EQ (stmt.Get<std::string> ("text"), value);
+  EXPECT_FALSE (stmt.Fetch ());
+}
+
+TEST_F (StatementTests, BindBatch)
+{
+  db.Get ().Execute (R"(
+    CREATE TABLE `test` (
+      `id` INT NOT NULL PRIMARY KEY,
+      `name` VARCHAR(64) NULL
+    )
+  )");
+
+  Statement stmt(*db.Get ());
+  stmt.Prepare (2, R"(
+    INSERT INTO `test`
+      (`id`, `name`) VALUES (?, ?)
+  )");
+  stmt.Bind<std::vector<int64_t>> (0, {1, 2, 3});
+  stmt.Bind<std::vector<std::string>> (1, {"a", "b", "c"});
+  stmt.BindNull (1, {false, true, false});
+  stmt.Execute ();
+
+  /* Running an empty batch is fine, too.  */
+  stmt.Reset ();
+  stmt.Bind<std::vector<int64_t>> (0, {});
+  stmt.Bind<std::vector<std::string>> (1, {});
+  stmt.Execute ();
+
+  stmt.Prepare (0, R"(
+    SELECT `id`, `name`
+      FROM `test`
+      ORDER BY `id`
+  )");
+  stmt.Query ();
+  ASSERT_TRUE (stmt.Fetch ());
+  EXPECT_EQ (stmt.Get<int64_t> ("id"), 1);
+  EXPECT_EQ (stmt.Get<std::string> ("name"), "a");
+  ASSERT_TRUE (stmt.Fetch ());
+  EXPECT_EQ (stmt.Get<int64_t> ("id"), 2);
+  EXPECT_TRUE (stmt.IsNull ("name"));
+  ASSERT_TRUE (stmt.Fetch ());
+  EXPECT_EQ (stmt.Get<int64_t> ("id"), 3);
+  EXPECT_EQ (stmt.Get<std::string> ("name"), "c");
   EXPECT_FALSE (stmt.Fetch ());
 }
 
