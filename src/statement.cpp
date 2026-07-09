@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2024 The Xaya developers
+// Copyright (C) 2023-2026 The Xaya developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -88,9 +88,18 @@ Statement::ResizeParams (const size_t num)
   params.resize (num);
   std::memset (params.data (), 0, num * sizeof (MYSQL_BIND));
 
-  intParams.resize (num);
-  stringParams.resize (num);
-  isNull.resize (num);
+  /* In the edge case of batchSize == 0, we want to be still able to
+     index into the arrays (at zero) without causing undefined behaviour,
+     thus use a minimum but non-zero size in this case.  */
+  const size_t total =
+      (batchSize == BATCH_UNDEFINED || batchSize == 0
+        ? num
+        : num * batchSize);
+
+  intParams.resize (total);
+  stringParams.resize (total);
+  stringPtrs.resize (total);
+  isNull.resize (total);
 }
 
 MYSQL_STMT*
@@ -117,6 +126,7 @@ Statement::Prepare (unsigned n, const std::string& sql)
 
   state = State::PREPARED;
   numParams = n;
+  batchSize = BATCH_UNDEFINED;
   ResizeParams (numParams);
 }
 
@@ -135,6 +145,7 @@ Statement::Reset ()
     throw StmtError (stmt);
 
   state = State::PREPARED;
+  batchSize = BATCH_UNDEFINED;
   ResizeParams (numParams);
 }
 
@@ -149,69 +160,214 @@ Statement::BindRaw (const unsigned num)
 void
 Statement::BindNull (const unsigned num)
 {
-  BindRaw (num)->buffer_type = MYSQL_TYPE_NULL;
+  if (batchSize == BATCH_UNDEFINED)
+    {
+      batchSize = 1;
+      ResizeParams (numParams);
+    }
+
+  auto* bnd = BindRaw (num);
+  bnd->buffer_type = MYSQL_TYPE_NULL;
+}
+
+void
+Statement::BindNull (const unsigned num, const std::vector<bool>& nullMask)
+{
+  const size_t count = nullMask.size ();
+  if (batchSize == BATCH_UNDEFINED)
+    {
+      batchSize = count;
+      ResizeParams (numParams);
+    }
+  CHECK_EQ (count, batchSize);
+
+  auto* bnd = BindRaw (num);
+  /* For the batch overload of BindNull, we require that the column has
+     previously been set to a non-NULL set of values and already has a type.
+     Then we just mask out some values that should be NULL.  */
+  CHECK_NE (bnd->buffer_type, 0)
+      << "Column " << num
+      << " should have been bound to some type before batch BindNull";
+  const size_t offset = num * batchSize;
+  /* u.indicator is of type char, which is compatible with the my_bool
+     stored in isNull, so we can reuse that.  But double check this is true
+     at compile time.  */
+  static_assert (
+      std::is_same<
+        decltype (isNull)::value_type,
+        std::remove_pointer_t<decltype (bnd->u.indicator)>
+      >::value,
+      "isNull element type must match MYSQL_BIND::u.indicator");
+  bnd->u.indicator = &isNull[offset];
+
+  for (size_t i = 0; i < count; ++i)
+    isNull[offset + i] = (nullMask[i]
+                            ? STMT_INDICATOR_NULL : STMT_INDICATOR_NONE);
+}
+
+void
+Statement::BindIntImpl (const unsigned num, const int64_t* data,
+                        const size_t count)
+{
+  if (batchSize == BATCH_UNDEFINED)
+    {
+      batchSize = count;
+      ResizeParams (numParams);
+    }
+  CHECK_EQ (count, batchSize);
+
+  static_assert (
+      sizeof (int64_t) == sizeof (decltype (intParams)::value_type),
+      "Mismatch between int64_t and intParams storage size");
+
+  auto* bnd = BindRaw (num);
+  bnd->buffer_type = MYSQL_TYPE_LONGLONG;
+  const size_t offset = num * batchSize;
+  bnd->buffer = &intParams[offset];
+  bnd->u.indicator = nullptr;
+  std::memcpy (bnd->buffer, data, count * sizeof (int64_t));
 }
 
 template <>
   void
   Statement::Bind<int64_t> (const unsigned num, const int64_t& val)
 {
-  auto* bnd = BindRaw (num);
+  BindIntImpl (num, &val, 1);
+}
 
-  intParams[num] = val;
-
-  bnd->buffer_type = MYSQL_TYPE_LONGLONG;
-  CHECK_GE (val, std::numeric_limits<decltype (intParams)::value_type>::min ())
-      << "Bound integer out of bounds for param type";
-  CHECK_LE (val, std::numeric_limits<decltype (intParams)::value_type>::max ())
-      << "Bound integer out of bounds for param type";
-  bnd->buffer = &intParams[num];
+template <>
+  void
+  Statement::Bind<std::vector<int64_t>> (const unsigned num,
+                                         const std::vector<int64_t>& vals)
+{
+  BindIntImpl (num, vals.data (), vals.size ());
 }
 
 template <>
   void
   Statement::Bind<bool> (const unsigned num, const bool& val)
 {
-  Bind<int64_t> (num, val);
+  Bind<int64_t> (num, val ? 1 : 0);
+}
+
+template <>
+  void
+  Statement::Bind<std::vector<bool>> (const unsigned num,
+                                      const std::vector<bool>& vals)
+{
+  const size_t count = vals.size ();
+  if (batchSize == BATCH_UNDEFINED)
+    {
+      batchSize = count;
+      ResizeParams (numParams);
+    }
+  CHECK_EQ (count, batchSize);
+
+  auto* bnd = BindRaw (num);
+  bnd->buffer_type = MYSQL_TYPE_LONGLONG;
+  const size_t offset = num * batchSize;
+  bnd->buffer = &intParams[offset];
+  bnd->u.indicator = nullptr;
+
+  for (size_t i = 0; i < count; ++i)
+    intParams[offset + i] = (vals[i] ? 1 : 0);
+}
+
+void
+Statement::BindStrImpl (const unsigned num, const std::string* data,
+                        const size_t count, const enum_field_types type)
+{
+  if (batchSize == BATCH_UNDEFINED)
+    {
+      batchSize = count;
+      ResizeParams (numParams);
+    }
+  CHECK_EQ (count, batchSize);
+
+  auto* bnd = BindRaw (num);
+  bnd->buffer_type = type;
+  bnd->u.indicator = nullptr;
+
+  const size_t offset = num * batchSize;
+  for (size_t i = 0; i < count; ++i)
+    {
+      stringParams[offset + i] = data[i];
+      stringPtrs[offset + i] = stringParams[offset + i].data ();
+      auto* sizePtr = GetBindLengthPtr (&intParams[offset + i]);
+      *sizePtr = data[i].size ();
+    }
+
+  /* In batch mode, we need to set the buffer to char** (array of pointers
+     to the string pointers themselves).  In scalar mode, it is expected to
+     be just char* (the string itself).  */
+  if (batchSize > 1)
+    bnd->buffer = const_cast<char**> (
+        reinterpret_cast<const char**> (&stringPtrs[offset]));
+  else
+    bnd->buffer = const_cast<char*> (stringParams[offset].data ());
+  bnd->length = GetBindLengthPtr (&intParams[offset]);
 }
 
 template <>
   void
   Statement::Bind<std::string> (const unsigned num, const std::string& val)
 {
-  BindBlob (num, val);
-  BindRaw (num)->buffer_type = MYSQL_TYPE_STRING;
+  BindStrImpl (num, &val, 1, MYSQL_TYPE_STRING);
+}
+
+template <>
+  void
+  Statement::Bind<std::vector<std::string>> (
+      const unsigned num, const std::vector<std::string>& vals)
+{
+  BindStrImpl (num, vals.data (), vals.size (), MYSQL_TYPE_STRING);
 }
 
 void
 Statement::BindBlob (const unsigned num, const std::string& val)
 {
-  auto* bnd = BindRaw (num);
+  BindStrImpl (num, &val, 1, MYSQL_TYPE_BLOB);
+}
 
-  stringParams[num] = val;
-  auto* sizePtr = GetBindLengthPtr (&intParams[num]);
-  *sizePtr = val.size ();
-
-  bnd->buffer_type = MYSQL_TYPE_BLOB;
-  bnd->buffer = const_cast<char*> (stringParams[num].data ());
-  bnd->length = sizePtr;
+void
+Statement::BindBlob (const unsigned num, const std::vector<std::string>& vals)
+{
+  BindStrImpl (num, vals.data (), vals.size (), MYSQL_TYPE_BLOB);
 }
 
 void
 Statement::Execute ()
 {
   CHECK (state == State::PREPARED) << "Statement is not in prepared state";
-  if (!params.empty () && mysql_stmt_bind_param (stmt, params.data ()) != 0)
-    throw StmtError (stmt);
 
-  if (mysql_stmt_execute (stmt) != 0)
+  bool execute = true;
+
+  if (numParams > 0)
+    {
+      CHECK_NE (batchSize, BATCH_UNDEFINED) << "No parameters have been bound";
+
+      if (batchSize > 1)
+        CHECK_EQ (
+            mysql_stmt_attr_set (stmt, STMT_ATTR_ARRAY_SIZE, &batchSize),
+            0);
+
+      if (batchSize == 0)
+        execute = false;
+      else if (mysql_stmt_bind_param (stmt, params.data ()) != 0)
+        throw StmtError (stmt);
+    }
+
+  if (execute && mysql_stmt_execute (stmt) != 0)
     throw StmtError (stmt);
 
   state = State::FINISHED;
 
+  batchSize = BATCH_UNDEFINED;
   params.clear ();
   intParams.clear ();
   stringParams.clear ();
+  stringPtrs.clear ();
+  isNull.clear ();
 }
 
 void
