@@ -1,16 +1,16 @@
-prefix=@prefix@
-exec_prefix=@exec_prefix@
-libdir=@libdir@
-includedir=@includedir@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
 
-Name: @PACKAGE_NAME@
-Version: @PACKAGE_VERSION@
+Name: @PROJECT_NAME@
+Version: @PROJECT_VERSION@
 
 Description: A basic C++ library for interacting with MySQL and MariaDB.
 URL: https://github.com/xaya/mypp
 
-Requires: @AX_PACKAGE_REQUIRES@
-Requires.private: @AX_PACKAGE_REQUIRES_PRIVATE@
+Requires: mariadb
+Requires.private: libglog
 
 Cflags: -I${includedir}
 Libs: -L${libdir} -lmypp
